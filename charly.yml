@@ -1,3 +1,14 @@
+defaults:
+    platform:
+        - linux/amd64
+    tag: auto
+    registry: ghcr.io/opencharly
+    build:
+        - rpm
+    merge:
+        auto: false
+        max_mb: 128
+
 podcast-audio:
     candy:
         description: |-
@@ -7,7 +18,7 @@ podcast-audio:
             is the candy that renders a DIALOGUE — the TTS candies synthesise one utterance in one
             voice, and nothing in the org assembled a conversation.
         require:
-            - '@github.com/opencharly/layer-kokoro-tts:v2026.281.0000'
+            - '@github.com/opencharly/layer-kokoro-tts:v2026.281.2126'
             - '@github.com/opencharly/layer-ffmpeg:v2026.272.0056'
         env:
             PODCAST_TTS_ENGINE: "~/.local/share/sherpa-onnx/runtime/bin/sherpa-onnx-offline-tts"
@@ -17,9 +28,10 @@ podcast-audio:
               mkdir: "${HOME}/.local/share/podcast-audio"
               run_as: "${USER}"
             - run: install the renderer script
+              copy: scripts/podcast-render
+              to: "${HOME}/.local/share/podcast-audio/podcast-render"
+              mode: "0755"
               run_as: "${USER}"
-              command: |
-                install -Dm755 scripts/podcast-render "${HOME}/.local/share/podcast-audio/podcast-render"
             - check: the renderer is installed
               file:
                 file: ${HOME}/.local/share/podcast-audio/podcast-render
@@ -32,27 +44,163 @@ podcast-audio:
               command: ${HOME}/.local/share/podcast-audio/podcast-render --help >/dev/null
             - check: it names each missing prerequisite instead of failing vaguely
               id: podcast-render-names-missing-engine
-              exit_status: 3
-              command: ${HOME}/.local/share/podcast-audio/podcast-render --model-dir=/nonexistent --self-test 2>&1 | grep -q 'engine is required\|engine not executable'
-            - check: SELF-TEST — a real two-host render, asserted end to end (the acceptance that can fail)
-              id: podcast-render-self-test
               exit_status: 0
               command: |
                 set -eu
+                R="${HOME}/.local/share/podcast-audio/podcast-render"
+                # The ENGINE guard, exercised for real: the candy's env provides the engine, so
+                # an override would skip this guard — unset it instead.
+                rc=0; msg=$(env -u PODCAST_TTS_ENGINE "$R" --model-dir=/nonexistent --self-test 2>&1) || rc=$?
+                [ "$rc" = 3 ] || { echo "engine guard exited $rc, expected 3" >&2; exit 1; }
+                printf '%s' "$msg" | grep -q 'engine is required'
+                # The MODEL-DIR guard, exercised for real: the engine is present, the dir is not.
+                rc=0; msg=$("$R" --model-dir=/nonexistent --self-test 2>&1) || rc=$?
+                [ "$rc" = 3 ] || { echo "model-dir guard exited $rc, expected 3" >&2; exit 1; }
+                printf '%s' "$msg" | grep -q "model dir is missing 'model.onnx'"
+            - check: SELF-TEST — the renderer runs on the candy's OWN env contract, no flags given
+              id: podcast-render-self-test
+              exit_status: 0
+              context:
+                - build
+                - runtime
+              command: |
+                set -eu
+                R="${HOME}/.local/share/podcast-audio/podcast-render"
+                # No --engine and no --model-dir: the defaults MUST come from the candy's own
+                # env contract, which is the path a user takes. `${PODCAST_TTS_*}` is NOT used
+                # here on purpose — a check step resolves only the auto-exports (${HOME},
+                # ${USER}), so naming a candy-declared variable would SKIP this step instead of
+                # running it (measured 2026-10-08 on the kokoro-tts bed).
                 d="$(mktemp -d)"
-                ${HOME}/.local/share/podcast-audio/podcast-render \
-                  --engine "${PODCAST_TTS_ENGINE}" \
-                  --model-dir "${PODCAST_TTS_MODEL_DIR}" \
-                  --out "$d/episode" --self-test
-                # wav + m4a + manifest all exist, the audio is real, and TWO voices were used
+                "$R" --out "$d/env" --self-test
+                test -s "$d/env.wav" && test -s "$d/env.m4a" && test -s "$d/env.manifest"
+            - check: a two-host render asserted end to end — audio, cast, pause and encode
+              id: podcast-render-two-hosts
+              exit_status: 0
+              context:
+                - build
+                - runtime
+              command: |
+                set -eu
+                R="${HOME}/.local/share/podcast-audio/podcast-render"
+                ENGINE="${HOME}/.local/share/sherpa-onnx/runtime/bin/sherpa-onnx-offline-tts"
+                MODEL="${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19"
+                d="$(mktemp -d)"
+                "$R" --engine "$ENGINE" --model-dir "$MODEL" --out "$d/episode" --self-test
                 test -s "$d/episode.wav" && test -s "$d/episode.m4a" && test -s "$d/episode.manifest"
                 ffprobe -v error -show_entries format=duration -of csv=p=0 "$d/episode.wav" \
                   | awk '{exit ($1 > 2.0) ? 0 : 1}'
-                grep -q '"sid":1' "$d/episode.manifest"   # CONCH  = af_bella  (US female)
-                grep -q '"sid":6' "$d/episode.manifest"   # TEMPER = am_michael (US male)
+                # the manifest names each speaker's VOICE and its id, not just a number
+                grep -q '"name":"CONCH","sid":1,"voice":"af_bella"'   "$d/episode.manifest"
+                grep -q '"name":"TEMPER","sid":6,"voice":"am_michael"' "$d/episode.manifest"
+                # the segments carry those ids, and the pause landed
+                grep -q '"sid":1' "$d/episode.manifest"
+                grep -q '"sid":6' "$d/episode.manifest"
                 grep -q '"kind":"pause"' "$d/episode.manifest"
                 ffprobe -v error -show_streams "$d/episode.m4a" | grep -q 'codec_name=aac'
+            - check: the cast is GENERIC — two names the table never had, mapped by --voice, labelled from the model's own voice table
+              id: podcast-render-generic-cast
+              exit_status: 0
+              context:
+                - build
+                - runtime
+              command: |
+                set -eu
+                R="${HOME}/.local/share/podcast-audio/podcast-render"
+                ENGINE="${HOME}/.local/share/sherpa-onnx/runtime/bin/sherpa-onnx-offline-tts"
+                MODEL="${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19"
+                d="$(mktemp -d)"
+                printf 'HOST_A: The first guest speaks this line.\n--\nHOST_B: And the second guest answers.\n' > "$d/guest.md"
+                "$R" --engine "$ENGINE" --model-dir "$MODEL" --voice HOST_A=9 --voice HOST_B=7 \
+                     --out "$d/guest" "$d/guest.md"
+                test -s "$d/guest.wav" && test -s "$d/guest.manifest"
+                # sid 9 is bm_george and sid 7 is bf_emma in the model's own metadata: a name
+                # the shipped cast never had must still be mapped AND truthfully labelled.
+                grep -q '"name":"HOST_A","sid":9,"voice":"bm_george"' "$d/guest.manifest"
+                grep -q '"name":"HOST_B","sid":7,"voice":"bf_emma"'   "$d/guest.manifest"
+            - check: a speaker the cast does not name is DROPPED with a warning, never silently voiced
+              id: podcast-render-unmapped-speaker
+              exit_status: 0
+              context:
+                - build
+                - runtime
+              command: |
+                set -eu
+                R="${HOME}/.local/share/podcast-audio/podcast-render"
+                ENGINE="${HOME}/.local/share/sherpa-onnx/runtime/bin/sherpa-onnx-offline-tts"
+                MODEL="${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19"
+                d="$(mktemp -d)"
+                printf 'NOBODY: this line must not be spoken.\n' > "$d/stray.md"
+                rc=0
+                "$R" --engine "$ENGINE" --model-dir "$MODEL" --out "$d/stray" "$d/stray.md" \
+                     2>"$d/stray.err" || rc=$?
+                [ "$rc" != 0 ] || { echo "an all-unmapped script rendered (exit 0)" >&2; exit 1; }
+                grep -q 'unmapped speaker NOBODY' "$d/stray.err"
 
+# =============================================================================
+# The R10 VENUE — /charly-check:check, "R10 gate by change class".
+#
+# The render is a RUNTIME change, so the gate is a fresh-rebuild run on a disposable
+# target: `charly check run check-podcast-audio-pod` builds this box, checks the built
+# image, deploys the pod, runs the candy's self-test render LIVE INSIDE it, rebuilds it
+# fresh, and tears it down. The render therefore executes both in a disposable container
+# (`charly check box podcast-audio-app`) and inside a running candybox. The bed adds no
+# duplicate checks (R3): it contributes the venue.
+#
+# `base:` is an EXTERNAL OCI ref on purpose — a bed that reaches a distro box through a
+# namespace import only resolves inside the umbrella's project graph, and this repo has
+# to be self-testable from its own checkout. The distro tag chain is load-bearing: the
+# package resolver walks the IMAGE's declared chain most-specific-first, so a box
+# declaring `base:` alone matches no per-distro section and silently installs nothing.
+# =============================================================================
+podcast-audio-app:
+    candy:
+        base: quay.io/fedora/fedora:43
+        description: |-
+            The podcast-audio box: a minimal Fedora base composing THIS checkout's
+            `podcast-audio` candy (no @github pin, so a bed run always tests the local tree).
+            It exists so the renderer has a disposable R10 venue — the candy installs the
+            renderer and pulls the engine, the multi-voice model and ffmpeg through its
+            `require:` chain, and this box is what the bed builds, deploys and rebuilds.
+        distro:
+            - fedora:43
+            - fedora
+        candy:
+            - podcast-audio
+        plan:
+            - check: the podcast-audio-app box was built on the Fedora 43 base it declares
+              id: podcast-audio-app-base-identity
+              exit_status: 0
+              stdout:
+                - contains: ID=fedora
+                - contains: VERSION_ID=43
+              context:
+                - build
+                - runtime
+              command: cat /etc/os-release
+check-podcast-audio-pod:
+    pod:
+        image: podcast-audio-app
+        disposable: true
+        lifecycle: dev
+        description: >-
+            R10 bed for the podcast-audio candy: the disposable pod the renderer is proved on.
+            It builds podcast-audio-app, deploys it, runs the candy's two-host self-test render
+            live inside the running pod, rebuilds it fresh, and tears it down. `charly check run
+            check-podcast-audio-pod` is the whole gate; the target is disposable, so the runner
+            may destroy and rebuild it unattended.
+        plan:
+            - check: the podcast-audio pod reached steady state
+              id: podcast-pod-running
+              exit_status: 0
+              stdout:
+                - contains: '"kind": "pod"'
+                - contains: check-podcast-audio-pod
+              context:
+                - runtime
+              command:
+                command: ${CHARLY_BIN} status --json
+                in_container: false
 podcast-audio-skill:
     skill:
         name: podcast-audio
@@ -79,33 +227,65 @@ podcast-audio-skill:
             CONCH: [stage directions in brackets] are never spoken.
             ```
 
-            A line whose first token is `NAME:` is spoken by NAME (mapped with `--voice NAME=SID`);
-            any other line is ignored as markup. Text in `[brackets]` is stripped before synthesis.
+            A line whose first token is `NAME:` is spoken by the cast row for NAME; any other
+            line is ignored as markup. Text in `[brackets]` is stripped before synthesis.
+
+            ## The cast — a table, not a schema
+
+            The renderer carries a cast table of `NAME<TAB>SID<TAB>VOICE` rows. The shipped
+            DEFAULT cast is the news desk's deliberate pair:
+
+            | NAME | SID | VOICE | |
+            |---|---|---|---|
+            | `CONCH` | 1 | `af_bella` | US female |
+            | `TEMPER` | 6 | `am_michael` | US male |
+
+            `--voice NAME=SID` adds or overrides a row for **any** name matching
+            `[A-Za-z][A-Za-z0-9_-]*`, so a script may name one speaker or twenty. A row given
+            without a `VOICE` column is labelled from the model's own voice table (the
+            `speaker2id` mapping `/charly-tools:kokoro-tts` publishes), so an override stays
+            truthfully named. `--self-test` speaks with the first two cast rows in cast order.
+
+            Every value-taking option accepts both `--opt value` and `--opt=value`.
 
             ## Usage
 
             ```
-            podcast-render --engine "$PODCAST_TTS_ENGINE" \\
-                           --model-dir "$PODCAST_TTS_MODEL_DIR" \\
+            podcast-render --engine "$PODCAST_TTS_ENGINE" \
+                           --model-dir "$PODCAST_TTS_MODEL_DIR" \
                            --out episode-2026-10-08 episode.md
-            podcast-render --self-test          # render a built-in two-line dialogue
+            podcast-render --self-test                  # render a built-in two-line dialogue
+            podcast-render --voice HOST_A=9 --voice HOST_B=7 episode.md
             ```
 
-            Outputs `PREFIX.wav`, `PREFIX.m4a` (AAC) and `PREFIX.manifest` (JSON: every segment's kind,
-            speaker id, duration and text).
+            Outputs `PREFIX.wav`, `PREFIX.m4a` (AAC) and `PREFIX.manifest`. The manifest is JSON:
+            the renderer, the source, both output paths, the full `voices` cast (each speaker's
+            `name`, `sid` and `voice`), the total duration, and the `segments` list — every
+            segment's kind, speaker id, duration and text.
 
             ## Why a manifest
 
             A render that cannot be checked is not a render. The manifest is the episode's evidence: the
             segment list is what proves two voices were used, that the pauses landed, and what the total
-            duration is — the numbers a fact-disciplined show must be able to state.
+            duration is — the numbers a fact-disciplined show must be able to state. The renderer
+            re-parses it as JSON before exiting when `python3` is present, and says so out loud when it
+            is not.
 
             ## Exit codes
 
-            Defaults: **CONCH `sid 1` (`af_bella`, US female)** and **TEMPER `sid 6` (`am_michael`, US male)**.
-
             `0` ok · `2` usage · `3` a named prerequisite is missing · `4` synthesis failed ·
             `5` assembly/encode failed · `6` the artifact failed its own assertions.
+            Every prerequisite guard names the missing thing and exits `3`.
+
+            ## Env
+
+            The candy declares the renderer's defaults, so a plain `podcast-render <episode.md>`
+            works with no flags on a target that composes it:
+
+            | Variable | Value |
+            |---|---|
+            | `PODCAST_TTS_ENGINE` | `~/.local/share/sherpa-onnx/runtime/bin/sherpa-onnx-offline-tts` |
+            | `PODCAST_TTS_MODEL_DIR` | `~/.local/share/kokoro-tts/models/kokoro-en-v0_19` |
 
             ## Related
 

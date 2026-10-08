@@ -7,7 +7,9 @@
 # emits a manifest. This does exactly that, and nothing else.
 #
 # It is a POSIX shell script on purpose: no Python, no pip, no venv — the whole toolchain
-# is a TTS engine + ffmpeg, both of which already ship as candies.
+# is a TTS engine + ffmpeg, both of which already ship as candies. It needs neither
+# python3 nor a JSON library to RUN; python3 is used only, when present, to re-parse the
+# manifest it just wrote (and the absence of it is announced, never silent).
 #
 # SCRIPT CUE SYNTAX (deliberately trivial, so an episode reads as prose):
 #
@@ -20,6 +22,15 @@
 # A line whose first token is `NAME:` is spoken by NAME; any other line is ignored as
 # narration/markup. Text inside [brackets] is stripped before synthesis.
 #
+# THE CAST IS A TABLE, NOT A SCHEMA. A speaker exists because a row names it:
+#
+#     NAME<TAB>SID<TAB>VOICE
+#
+# The shipped DEFAULT cast is the news desk's deliberate pair — CONCH on sid 1
+# (`af_bella`, US female) and TEMPER on sid 6 (`am_michael`, US male) — and `--voice`
+# adds or overrides ANY name, so a script may name one speaker or twenty. A row given
+# without a VOICE column is labelled from the model's own voice table below.
+#
 # Usage:
 #   podcast-render [options] <episode.md>
 #   podcast-render --self-test [options]        # render a built-in 2-line dialogue
@@ -30,16 +41,18 @@
 #   --out PREFIX       output prefix; writes PREFIX.wav, PREFIX.m4a and PREFIX.manifest
 #   --gap MS           silence between segments in ms (default 350)
 #   --pause MS         silence for a bare "--" cue in ms (default 900)
-#   --voice NAME=SID   map a speaker name to an engine speaker id (repeatable).
-#                      Defaults: CONCH=1 (af_bella, US female), TEMPER=6 (am_michael, US male).
-#                      The engine's full mapping for kokoro-en-v0_19 (from the model's own
-#                      speaker2id metadata) is af/af_bella/af_nicole/af_sarah/af_sky = female US,
-#                      am_adam/am_michael = male US, bf_emma/bf_isabella = female UK,
-#                      bm_george/bm_lewis = male UK.
+#   --voice NAME=SID   add or override a cast row for ANY speaker name (repeatable).
+#                      NAME must match [A-Za-z][A-Za-z0-9_-]*; SID is an engine speaker id.
+#                      Its voice label is read from the model's own table below, so an
+#                      override stays truthfully named in the manifest.
 #   --speed F          speech speed, passed as --vits-length-scale (default 1.0)
 #   --bitrate R        AAC bitrate for the .m4a (default 128k)
-#   --self-test        ignore any input file and render a built-in dialogue
+#   --self-test        ignore any input file and render a built-in dialogue with the first
+#                      two cast entries
 #   -h | --help        this text
+#
+# Every value-taking option accepts BOTH `--opt value` and `--opt=value`, because the
+# engine's own CLI uses the `=` form and our checks are written in it.
 #
 # Exit codes: 0 ok; 2 usage error; 3 a prerequisite is missing; 4 synthesis failed;
 #             5 assembly/encode failed; 6 the produced artifact failed its own assertions.
@@ -53,13 +66,28 @@ PAUSE=900
 SPEED=1.0
 BITRATE=128k
 SELF_TEST=0
-VOICE_CONCH=1   # af_bella — US female
-VOICE_TEMPER=6  # am_michael — US male
 INPUT=""
 
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+# The model's OWN voice table (kokoro-en-v0_19, from its speaker2id metadata — the same
+# mapping /charly-tools:kokoro-tts publishes): `sid<TAB>voice`. It exists so a cast row
+# carries a truthful label without the author retyping one.
+VOICE_TABLE="$(printf '0\taf\n1\taf_bella\n2\taf_nicole\n3\taf_sarah\n4\taf_sky\n5\tam_adam\n6\tam_michael\n7\tbf_emma\n8\tbf_isabella\n9\tbm_george\n10\tbm_lewis')"
+
+# The shipped DEFAULT cast: NAME<TAB>SID<TAB>VOICE. A default, not a schema — --voice
+# adds or overrides any row, and a row with an empty VOICE column is labelled from
+# VOICE_TABLE.
+CAST_DEFAULT="$(printf 'CONCH\t1\taf_bella\nTEMPER\t6\tam_michael')"
+CAST_OVERRIDES=""
+
+usage() { awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else { exit } }' "$0"; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do
+  # Accept the --opt=value form for every value-taking option, by splitting it into the
+  # two-argument form the rest of this loop already speaks.
+  case "$1" in
+    --engine=*|--model-dir=*|--out=*|--gap=*|--pause=*|--speed=*|--bitrate=*|--voice=*)
+      opt="${1%%=*}"; val="${1#*=}"; shift; set -- "$opt" "$val" "$@" ;;
+  esac
   case "$1" in
     --engine)    [ $# -ge 2 ] || usage 2; ENGINE="$2"; shift 2 ;;
     --model-dir) [ $# -ge 2 ] || usage 2; MODEL_DIR="$2"; shift 2 ;;
@@ -69,11 +97,14 @@ while [ $# -gt 0 ]; do
     --speed)     [ $# -ge 2 ] || usage 2; SPEED="$2"; shift 2 ;;
     --bitrate)   [ $# -ge 2 ] || usage 2; BITRATE="$2"; shift 2 ;;
     --voice)     [ $# -ge 2 ] || usage 2
-                 case "$2" in
-                   CONCH=*)  VOICE_CONCH="${2#CONCH=}" ;;
-                   TEMPER=*) VOICE_TEMPER="${2#TEMPER=}" ;;
-                   *) echo "podcast-render: --voice wants NAME=SID (CONCH|TEMPER), got '$2'" >&2; exit 2 ;;
-                 esac; shift 2 ;;
+                 vname="${2%%=*}"; vsid="${2#*=}"
+                 case "$2" in *=*) ;; *) echo "podcast-render: --voice wants NAME=SID, got '$2'" >&2; exit 2 ;; esac
+                 case "$vname" in ''|[!A-Za-z]*|*[!A-Za-z0-9_-]*)
+                   echo "podcast-render: --voice NAME must match [A-Za-z][A-Za-z0-9_-]*, got '$vname'" >&2; exit 2 ;; esac
+                 case "$vsid" in ''|*[!0-9]*)
+                   echo "podcast-render: --voice SID must be a non-negative integer, got '$vsid'" >&2; exit 2 ;; esac
+                 CAST_OVERRIDES="${CAST_OVERRIDES}${vname}	${vsid}	
+"; shift 2 ;;
     --self-test) SELF_TEST=1; shift ;;
     -h|--help)   usage 0 ;;
     -*)          echo "podcast-render: unknown option '$1'" >&2; exit 2 ;;
@@ -97,24 +128,41 @@ command -v ffprobe >/dev/null || { echo "podcast-render: ffprobe not found" >&2;
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM
 
-sid_for() {
-  case "$1" in
-    CONCH)  printf '%s' "$VOICE_CONCH" ;;
-    TEMPER) printf '%s' "$VOICE_TEMPER" ;;
-    *)      printf '' ;;
-  esac
-}
+# --- the cast: NAME<TAB>SID<TAB>VOICE, one row per speaker, LAST row for a name wins --
+# Nothing downstream knows any speaker by name; this table is the only place names exist.
+: > "$WORK/cast.raw"
+printf '%s\n' "$CAST_DEFAULT" >> "$WORK/cast.raw"
+[ -z "$CAST_OVERRIDES" ] || printf '%s' "$CAST_OVERRIDES" >> "$WORK/cast.raw"
+CAST="$WORK/cast.tsv"
+awk -F'\t' -v table="$VOICE_TABLE" '
+  # VOICE_TABLE holds the rows themselves, not a path: split it on newlines.
+  BEGIN { rows_n = split(table, rows, "\n"); for (i = 1; i <= rows_n; i++) { split(rows[i], kv, "\t"); V[kv[1]] = kv[2] } }
+  { sid[$1] = $2
+    if ($3 != "") lab[$1] = $3
+    else if ($2 in V) lab[$1] = V[$2]
+    else lab[$1] = "sid-" $2
+    if (!($1 in idx)) idx[$1] = ++n
+  }
+  END { for (i = 1; i <= n; i++) for (k in idx) if (idx[k] == i) printf "%s\t%s\t%s\n", k, sid[k], lab[k] }
+' "$WORK/cast.raw" > "$CAST"
+[ -s "$CAST" ] || { echo "podcast-render: the cast is empty" >&2; exit 2; }
 
 # --- 1. the cue list: "SID<TAB>TEXT" or "PAUSE<TAB>" --------------------------------
 CUES="$WORK/cues"
 : > "$CUES"
 if [ "$SELF_TEST" = 1 ]; then
-  printf '%s\tFacts first, revolution second. That is the whole law of this desk.\n' "$VOICE_CONCH" >> "$CUES"
+  # The built-in dialogue speaks with the FIRST TWO cast entries, in cast order — so the
+  # self-test exercises whatever cast is in play, never a pair hardcoded beside the table.
+  s1=$(sed -n '1p' "$CAST" | cut -f2)
+  s2=$(sed -n '2p' "$CAST" | cut -f2)
+  [ -n "$s1" ] && [ -n "$s2" ] || { echo "podcast-render: --self-test needs at least two cast entries" >&2; exit 2; }
+  printf '%s\tFacts first, revolution second. That is the whole law of this desk.\n' "$s1" >> "$CUES"
   printf 'PAUSE\t\n' >> "$CUES"
-  printf '%s\tAgreed. And that is why every claim I make has a receipt behind it.\n' "$VOICE_TEMPER" >> "$CUES"
+  printf '%s\tAgreed. And that is why every claim I make has a receipt behind it.\n' "$s2" >> "$CUES"
 else
   # NAME: text  -> a speaker cue.  bare "--" -> a pause.  anything else -> ignored.
-  awk -v conch="$VOICE_CONCH" -v temper="$VOICE_TEMPER" '
+  awk -F'\t' -v cast="$CAST" '
+    BEGIN { while ((getline l < cast) > 0) { split(l, kv, "\t"); M[kv[1]] = kv[2] } }
     /^[[:space:]]*--[[:space:]]*$/ { print "PAUSE\t"; next }
     {
       line = $0
@@ -125,9 +173,7 @@ else
         # strip [stage directions]
         gsub(/\[[^]]*\]/, "", text)
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", text)
-        sid = ""
-        if (name == "CONCH") sid = conch
-        else if (name == "TEMPER") sid = temper
+        sid = (name in M) ? M[name] : ""
         if (sid != "" && length(text) > 0) printf "%s\t%s\n", sid, text
         else if (sid == "" && length(text) > 0)
           printf "WARN\tunmapped speaker %s (line dropped)\n", name > "/dev/stderr"
@@ -193,7 +239,9 @@ total=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUT.wav")
   printf '  "source": %s,\n' "$(if [ "$SELF_TEST" = 1 ]; then printf '"self-test"'; else printf '"%s"' "$INPUT"; fi)"
   printf '  "output_wav": "%s.wav",\n' "$OUT"
   printf '  "output_m4a": "%s.m4a",\n' "$OUT"
-  printf '  "voices": {"CONCH": %s, "TEMPER": %s},\n' "$VOICE_CONCH" "$VOICE_TEMPER"
+  printf '  "voices": [\n'
+  awk -F'\t' '{printf "%s    {\"name\":\"%s\",\"sid\":%s,\"voice\":\"%s\"}", (NR>1 ? ",\n" : ""), $1, $2, $3}' "$CAST"
+  printf '\n  ],\n'
   printf '  "total_duration_s": %s,\n' "$total"
   printf '  "segments": [\n'
   awk 'BEGIN{first=1} {if(!first) printf ",\n"; first=0; printf "    %s", $0} END{printf "\n"}' "$WORK/manifest.parts"
@@ -207,11 +255,19 @@ m4a_bytes=$(wc -c < "$OUT.m4a")
 [ "$wav_bytes" -gt 20000 ] || { echo "podcast-render: wav suspiciously small ($wav_bytes bytes)" >&2; exit 6; }
 [ "$m4a_bytes" -gt 5000 ]  || { echo "podcast-render: m4a suspiciously small ($m4a_bytes bytes)" >&2; exit 6; }
 awk -v t="$total" 'BEGIN{if (t+0 <= 0.5) exit 1}' || { echo "podcast-render: total duration is not positive ($total)" >&2; exit 6; }
+# The manifest is the episode's evidence, so it must PARSE. Live-or-skip-visible: without
+# python3 the structural checks above still ran, and the skip says so out loud.
+if command -v python3 >/dev/null 2>&1; then
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$OUT.manifest" \
+    || { echo "podcast-render: manifest is not valid JSON: $OUT.manifest" >&2; exit 6; }
+else
+  echo "podcast-render: note — python3 absent; manifest JSON not parsed (structural checks only)" >&2
+fi
 # two speakers must have produced DIFFERENT audio, or we rendered one voice twice
 if [ "$SELF_TEST" = 1 ]; then
   voices_used=$(grep -c '"kind":"speech"' "$WORK/manifest.parts" || true)
   distinct=$(awk -F'"sid":' '/"kind":"speech"/{split($2,a,","); print a[1]}' "$WORK/manifest.parts" | sort -u | wc -l)
-  [ "${distinct:-0}" -ge 2 ] || { echo "podcast-render: self-test used $distinct distinct voice(s), expected 2" >&2; exit 6; }
+  [ "${distinct:-0}" -ge 2 ] || { echo "podcast-render: self-test used $distinct distinct voice(s), expected >= 2" >&2; exit 6; }
   [ "${voices_used:-0}" -ge 2 ] || { echo "podcast-render: self-test rendered $voices_used speech segment(s), expected 2" >&2; exit 6; }
 fi
 
