@@ -31,7 +31,11 @@
 #   --gap MS           silence between segments in ms (default 350)
 #   --pause MS         silence for a bare "--" cue in ms (default 900)
 #   --voice NAME=SID   map a speaker name to an engine speaker id (repeatable).
-#                      Defaults: CONCH=0, TEMPER=3
+#                      Defaults: CONCH=1 (af_bella, US female), TEMPER=6 (am_michael, US male).
+#                      The engine's full mapping for kokoro-en-v0_19 (from the model's own
+#                      speaker2id metadata) is af/af_bella/af_nicole/af_sarah/af_sky = female US,
+#                      am_adam/am_michael = male US, bf_emma/bf_isabella = female UK,
+#                      bm_george/bm_lewis = male UK.
 #   --speed F          speech speed, passed as --vits-length-scale (default 1.0)
 #   --bitrate R        AAC bitrate for the .m4a (default 128k)
 #   --self-test        ignore any input file and render a built-in dialogue
@@ -49,8 +53,8 @@ PAUSE=900
 SPEED=1.0
 BITRATE=128k
 SELF_TEST=0
-VOICE_CONCH=0
-VOICE_TEMPER=3
+VOICE_CONCH=1   # af_bella — US female
+VOICE_TEMPER=6  # am_michael — US male
 INPUT=""
 
 usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }

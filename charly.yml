@@ -48,8 +48,8 @@ podcast-audio:
                 test -s "$d/episode.wav" && test -s "$d/episode.m4a" && test -s "$d/episode.manifest"
                 ffprobe -v error -show_entries format=duration -of csv=p=0 "$d/episode.wav" \
                   | awk '{exit ($1 > 2.0) ? 0 : 1}'
-                grep -q '"sid":0' "$d/episode.manifest"
-                grep -q '"sid":3' "$d/episode.manifest"
+                grep -q '"sid":1' "$d/episode.manifest"   # CONCH  = af_bella  (US female)
+                grep -q '"sid":6' "$d/episode.manifest"   # TEMPER = am_michael (US male)
                 grep -q '"kind":"pause"' "$d/episode.manifest"
                 ffprobe -v error -show_streams "$d/episode.m4a" | grep -q 'codec_name=aac'
 
@@ -101,6 +101,8 @@ podcast-audio-skill:
             duration is — the numbers a fact-disciplined show must be able to state.
 
             ## Exit codes
+
+            Defaults: **CONCH `sid 1` (`af_bella`, US female)** and **TEMPER `sid 6` (`am_michael`, US male)**.
 
             `0` ok · `2` usage · `3` a named prerequisite is missing · `4` synthesis failed ·
             `5` assembly/encode failed · `6` the artifact failed its own assertions.
