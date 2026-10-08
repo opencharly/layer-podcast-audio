@@ -1,0 +1,112 @@
+podcast-audio:
+    candy:
+        description: |-
+            Turn a two-host episode SCRIPT into audio: parse the speaker-tagged markdown, synthesise each
+            cue in its own voice, assemble the segments with real pauses, loudness-normalise, encode
+            WAV + AAC/M4A, and emit a manifest naming every segment's speaker, duration and text. This
+            is the candy that renders a DIALOGUE — the TTS candies synthesise one utterance in one
+            voice, and nothing in the org assembled a conversation.
+        require:
+            - '@github.com/opencharly/layer-kokoro-tts:v2026.281.0000'
+            - '@github.com/opencharly/layer-ffmpeg:v2026.272.0056'
+        env:
+            PODCAST_TTS_ENGINE: "~/.local/share/sherpa-onnx/runtime/bin/sherpa-onnx-offline-tts"
+            PODCAST_TTS_MODEL_DIR: "~/.local/share/kokoro-tts/models/kokoro-en-v0_19"
+        plan:
+            - run: mkdir=${HOME}/.local/share/podcast-audio
+              mkdir: "${HOME}/.local/share/podcast-audio"
+              run_as: "${USER}"
+            - run: install the renderer script
+              run_as: "${USER}"
+              command: |
+                install -Dm755 scripts/podcast-render "${HOME}/.local/share/podcast-audio/podcast-render"
+            - check: the renderer is installed
+              file:
+                file: ${HOME}/.local/share/podcast-audio/podcast-render
+                exists: true
+            - check: the renderer is executable
+              exit_status: 0
+              command: test -x ${HOME}/.local/share/podcast-audio/podcast-render
+            - check: the renderer's own usage surface answers
+              exit_status: 0
+              command: ${HOME}/.local/share/podcast-audio/podcast-render --help >/dev/null
+            - check: it names each missing prerequisite instead of failing vaguely
+              id: podcast-render-names-missing-engine
+              exit_status: 3
+              command: ${HOME}/.local/share/podcast-audio/podcast-render --model-dir=/nonexistent --self-test 2>&1 | grep -q 'engine is required\|engine not executable'
+            - check: SELF-TEST — a real two-host render, asserted end to end (the acceptance that can fail)
+              id: podcast-render-self-test
+              exit_status: 0
+              command: |
+                set -eu
+                d="$(mktemp -d)"
+                ${HOME}/.local/share/podcast-audio/podcast-render \
+                  --engine "${PODCAST_TTS_ENGINE}" \
+                  --model-dir "${PODCAST_TTS_MODEL_DIR}" \
+                  --out "$d/episode" --self-test
+                # wav + m4a + manifest all exist, the audio is real, and TWO voices were used
+                test -s "$d/episode.wav" && test -s "$d/episode.m4a" && test -s "$d/episode.manifest"
+                ffprobe -v error -show_entries format=duration -of csv=p=0 "$d/episode.wav" \
+                  | awk '{exit ($1 > 2.0) ? 0 : 1}'
+                grep -q '"sid":0' "$d/episode.manifest"
+                grep -q '"sid":3' "$d/episode.manifest"
+                grep -q '"kind":"pause"' "$d/episode.manifest"
+                ffprobe -v error -show_streams "$d/episode.m4a" | grep -q 'codec_name=aac'
+
+podcast-audio-skill:
+    skill:
+        name: podcast-audio
+        family: tools
+        owner: podcast-audio
+        description: |-
+            Render a two-host podcast SCRIPT into audio — parse speaker-tagged markdown, synthesise each
+            cue in its own voice, assemble with pauses, normalise, encode WAV + AAC/M4A, and emit a
+            per-segment manifest. Use when a written dialogue or episode script must become an audio file.
+        content: |
+            # podcast-audio — script to episode
+
+            ## What it is
+
+            `podcast-render`: a POSIX shell renderer (no Python, no pip, no venv) that turns a
+            speaker-tagged episode into an audio file plus a manifest of its own receipts.
+
+            ## Cue syntax
+
+            ```
+            CONCH: The first host speaks this line.
+            TEMPER: And the second host answers.
+            --                                  # a bare "--" is a pause, not speech
+            CONCH: [stage directions in brackets] are never spoken.
+            ```
+
+            A line whose first token is `NAME:` is spoken by NAME (mapped with `--voice NAME=SID`);
+            any other line is ignored as markup. Text in `[brackets]` is stripped before synthesis.
+
+            ## Usage
+
+            ```
+            podcast-render --engine "$PODCAST_TTS_ENGINE" \\
+                           --model-dir "$PODCAST_TTS_MODEL_DIR" \\
+                           --out episode-2026-10-08 episode.md
+            podcast-render --self-test          # render a built-in two-line dialogue
+            ```
+
+            Outputs `PREFIX.wav`, `PREFIX.m4a` (AAC) and `PREFIX.manifest` (JSON: every segment's kind,
+            speaker id, duration and text).
+
+            ## Why a manifest
+
+            A render that cannot be checked is not a render. The manifest is the episode's evidence: the
+            segment list is what proves two voices were used, that the pauses landed, and what the total
+            duration is — the numbers a fact-disciplined show must be able to state.
+
+            ## Exit codes
+
+            `0` ok · `2` usage · `3` a named prerequisite is missing · `4` synthesis failed ·
+            `5` assembly/encode failed · `6` the artifact failed its own assertions.
+
+            ## Related
+
+            - `/charly-tools:kokoro-tts` — the multi-voice engine this renders with
+            - `/charly-tools:sherpa-onnx` — the engine, and the single-voice alternative
+            - `/charly-tools:ffmpeg` — the encoder and inspector used for assembly

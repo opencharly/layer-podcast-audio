@@ -1,0 +1,215 @@
+#!/bin/sh
+# podcast-render — turn a two-host episode script into audio.
+#
+# The missing capability this exists for: nothing in the org renders a DIALOGUE. The
+# sherpa-onnx candy synthesises one utterance in one voice; ffmpeg encodes; nothing
+# parses a speaker-tagged script, picks a voice per speaker, assembles the segments and
+# emits a manifest. This does exactly that, and nothing else.
+#
+# It is a POSIX shell script on purpose: no Python, no pip, no venv — the whole toolchain
+# is a TTS engine + ffmpeg, both of which already ship as candies.
+#
+# SCRIPT CUE SYNTAX (deliberately trivial, so an episode reads as prose):
+#
+#     # Episode title
+#     CONCH: The first host speaks this line.
+#     TEMPER: And the second host answers.
+#     --                      <- a bare "--" is a pause, not speech
+#     CONCH: [stage directions in brackets] are never spoken.
+#
+# A line whose first token is `NAME:` is spoken by NAME; any other line is ignored as
+# narration/markup. Text inside [brackets] is stripped before synthesis.
+#
+# Usage:
+#   podcast-render [options] <episode.md>
+#   podcast-render --self-test [options]        # render a built-in 2-line dialogue
+#
+# Options:
+#   --engine PATH      sherpa-onnx-offline-tts binary
+#   --model-dir DIR    directory holding model.onnx, voices.bin, tokens.txt, espeak-ng-data/
+#   --out PREFIX       output prefix; writes PREFIX.wav, PREFIX.m4a and PREFIX.manifest
+#   --gap MS           silence between segments in ms (default 350)
+#   --pause MS         silence for a bare "--" cue in ms (default 900)
+#   --voice NAME=SID   map a speaker name to an engine speaker id (repeatable).
+#                      Defaults: CONCH=0, TEMPER=3
+#   --speed F          speech speed, passed as --vits-length-scale (default 1.0)
+#   --bitrate R        AAC bitrate for the .m4a (default 128k)
+#   --self-test        ignore any input file and render a built-in dialogue
+#   -h | --help        this text
+#
+# Exit codes: 0 ok; 2 usage error; 3 a prerequisite is missing; 4 synthesis failed;
+#             5 assembly/encode failed; 6 the produced artifact failed its own assertions.
+set -eu
+
+ENGINE="${PODCAST_TTS_ENGINE:-}"
+MODEL_DIR="${PODCAST_TTS_MODEL_DIR:-}"
+OUT="episode"
+GAP=350
+PAUSE=900
+SPEED=1.0
+BITRATE=128k
+SELF_TEST=0
+VOICE_CONCH=0
+VOICE_TEMPER=3
+INPUT=""
+
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --engine)    [ $# -ge 2 ] || usage 2; ENGINE="$2"; shift 2 ;;
+    --model-dir) [ $# -ge 2 ] || usage 2; MODEL_DIR="$2"; shift 2 ;;
+    --out)       [ $# -ge 2 ] || usage 2; OUT="$2"; shift 2 ;;
+    --gap)       [ $# -ge 2 ] || usage 2; GAP="$2"; shift 2 ;;
+    --pause)     [ $# -ge 2 ] || usage 2; PAUSE="$2"; shift 2 ;;
+    --speed)     [ $# -ge 2 ] || usage 2; SPEED="$2"; shift 2 ;;
+    --bitrate)   [ $# -ge 2 ] || usage 2; BITRATE="$2"; shift 2 ;;
+    --voice)     [ $# -ge 2 ] || usage 2
+                 case "$2" in
+                   CONCH=*)  VOICE_CONCH="${2#CONCH=}" ;;
+                   TEMPER=*) VOICE_TEMPER="${2#TEMPER=}" ;;
+                   *) echo "podcast-render: --voice wants NAME=SID (CONCH|TEMPER), got '$2'" >&2; exit 2 ;;
+                 esac; shift 2 ;;
+    --self-test) SELF_TEST=1; shift ;;
+    -h|--help)   usage 0 ;;
+    -*)          echo "podcast-render: unknown option '$1'" >&2; exit 2 ;;
+    *)           INPUT="$1"; shift ;;
+  esac
+done
+
+# --- prerequisites, named individually so a failure says WHICH one ------------------
+[ -n "$ENGINE" ] || { echo "podcast-render: --engine is required (or PODCAST_TTS_ENGINE)" >&2; exit 3; }
+[ -x "$ENGINE" ] || { echo "podcast-render: engine not executable: $ENGINE" >&2; exit 3; }
+[ -n "$MODEL_DIR" ] || { echo "podcast-render: --model-dir is required (or PODCAST_TTS_MODEL_DIR)" >&2; exit 3; }
+for f in model.onnx voices.bin tokens.txt espeak-ng-data; do
+  [ -e "$MODEL_DIR/$f" ] || { echo "podcast-render: model dir is missing '$f': $MODEL_DIR" >&2; exit 3; }
+done
+command -v ffmpeg  >/dev/null || { echo "podcast-render: ffmpeg not found" >&2; exit 3; }
+command -v ffprobe >/dev/null || { echo "podcast-render: ffprobe not found" >&2; exit 3; }
+
+[ "$SELF_TEST" = 1 ] || [ -n "$INPUT" ] || { echo "podcast-render: no episode file (or use --self-test)" >&2; exit 2; }
+[ "$SELF_TEST" = 1 ] || [ -f "$INPUT" ] || { echo "podcast-render: no such episode: $INPUT" >&2; exit 2; }
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT INT TERM
+
+sid_for() {
+  case "$1" in
+    CONCH)  printf '%s' "$VOICE_CONCH" ;;
+    TEMPER) printf '%s' "$VOICE_TEMPER" ;;
+    *)      printf '' ;;
+  esac
+}
+
+# --- 1. the cue list: "SID<TAB>TEXT" or "PAUSE<TAB>" --------------------------------
+CUES="$WORK/cues"
+: > "$CUES"
+if [ "$SELF_TEST" = 1 ]; then
+  printf '%s\tFacts first, revolution second. That is the whole law of this desk.\n' "$VOICE_CONCH" >> "$CUES"
+  printf 'PAUSE\t\n' >> "$CUES"
+  printf '%s\tAgreed. And that is why every claim I make has a receipt behind it.\n' "$VOICE_TEMPER" >> "$CUES"
+else
+  # NAME: text  -> a speaker cue.  bare "--" -> a pause.  anything else -> ignored.
+  awk -v conch="$VOICE_CONCH" -v temper="$VOICE_TEMPER" '
+    /^[[:space:]]*--[[:space:]]*$/ { print "PAUSE\t"; next }
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (line ~ /^[A-Za-z][A-Za-z0-9_-]*:/) {
+        name = line; sub(/:.*$/, "", name)
+        text = line; sub(/^[^:]*:[[:space:]]*/, "", text)
+        # strip [stage directions]
+        gsub(/\[[^]]*\]/, "", text)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", text)
+        sid = ""
+        if (name == "CONCH") sid = conch
+        else if (name == "TEMPER") sid = temper
+        if (sid != "" && length(text) > 0) printf "%s\t%s\n", sid, text
+        else if (sid == "" && length(text) > 0)
+          printf "WARN\tunmapped speaker %s (line dropped)\n", name > "/dev/stderr"
+      }
+    }
+  ' "$INPUT" >> "$CUES"
+fi
+
+n_cues=$(grep -c . "$CUES" || true)
+[ "${n_cues:-0}" -gt 0 ] || { echo "podcast-render: no speaker cues found in the script" >&2; exit 4; }
+
+# --- 2. synthesise each cue ---------------------------------------------------------
+i=0
+: > "$WORK/list.txt"
+: > "$WORK/manifest.parts"
+while IFS="$(printf '\t')" read -r sid text; do
+  i=$((i + 1))
+  seg="$WORK/seg$(printf '%03d' "$i").wav"
+  if [ "$sid" = "PAUSE" ]; then
+    ffmpeg -y -loglevel error -f lavfi -i "anullsrc=r=24000:cl=mono" -t "$(awk -v ms="$PAUSE" 'BEGIN{printf "%.3f", ms/1000}')" "$seg" \
+      || { echo "podcast-render: pause generation failed at cue $i" >&2; exit 5; }
+    dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$seg")
+    printf '{"index":%d,"kind":"pause","ms":%s,"duration_s":%s}\n' "$i" "$PAUSE" "$dur" >> "$WORK/manifest.parts"
+  else
+    "$ENGINE" \
+      --kokoro-model="$MODEL_DIR/model.onnx" \
+      --kokoro-voices="$MODEL_DIR/voices.bin" \
+      --kokoro-tokens="$MODEL_DIR/tokens.txt" \
+      --kokoro-data-dir="$MODEL_DIR/espeak-ng-data" \
+      --sid="$sid" --vits-length-scale="$SPEED" \
+      --output-filename="$seg" "$text" >"$WORK/tts.log" 2>&1 \
+      || { echo "podcast-render: synthesis failed at cue $i (sid=$sid); engine log:" >&2; tail -3 "$WORK/tts.log" >&2; exit 4; }
+    [ -s "$seg" ] || { echo "podcast-render: engine wrote nothing for cue $i" >&2; exit 4; }
+    dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$seg")
+    printf '{"index":%d,"kind":"speech","sid":%s,"duration_s":%s,"text":%s}\n' \
+      "$i" "$sid" "$dur" "$(printf '%s' "$text" | sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/"/')" >> "$WORK/manifest.parts"
+  fi
+  printf "file '%s'\n" "$seg" >> "$WORK/list.txt"
+  # inter-segment gap
+  if [ "$i" -lt "$n_cues" ] && [ "$GAP" -gt 0 ]; then
+    g="$WORK/gap$(printf '%03d' "$i").wav"
+    ffmpeg -y -loglevel error -f lavfi -i "anullsrc=r=24000:cl=mono" -t "$(awk -v ms="$GAP" 'BEGIN{printf "%.3f", ms/1000}')" "$g" \
+      || { echo "podcast-render: gap generation failed after cue $i" >&2; exit 5; }
+    printf "file '%s'\n" "$g" >> "$WORK/list.txt"
+  fi
+done < "$CUES"
+
+# --- 3. concat + loudness-normalise -> wav, then encode AAC -> m4a ------------------
+ffmpeg -y -loglevel error -f concat -safe 0 -i "$WORK/list.txt" \
+  -af "loudnorm=I=-16:TP=-1.5:LRA=11" -ar 24000 -ac 1 "$OUT.wav" \
+  || { echo "podcast-render: concat/normalise failed" >&2; exit 5; }
+[ -s "$OUT.wav" ] || { echo "podcast-render: no wav produced" >&2; exit 5; }
+
+ffmpeg -y -loglevel error -i "$OUT.wav" -c:a aac -b:a "$BITRATE" -movflags +faststart "$OUT.m4a" \
+  || { echo "podcast-render: AAC encode failed" >&2; exit 5; }
+[ -s "$OUT.m4a" ] || { echo "podcast-render: no m4a produced" >&2; exit 5; }
+
+# --- 4. the manifest: the episode's own receipts ------------------------------------
+total=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUT.wav")
+{
+  printf '{\n'
+  printf '  "renderer": "podcast-render",\n'
+  printf '  "source": %s,\n' "$(if [ "$SELF_TEST" = 1 ]; then printf '"self-test"'; else printf '"%s"' "$INPUT"; fi)"
+  printf '  "output_wav": "%s.wav",\n' "$OUT"
+  printf '  "output_m4a": "%s.m4a",\n' "$OUT"
+  printf '  "voices": {"CONCH": %s, "TEMPER": %s},\n' "$VOICE_CONCH" "$VOICE_TEMPER"
+  printf '  "total_duration_s": %s,\n' "$total"
+  printf '  "segments": [\n'
+  awk 'BEGIN{first=1} {if(!first) printf ",\n"; first=0; printf "    %s", $0} END{printf "\n"}' "$WORK/manifest.parts"
+  printf '  ]\n'
+  printf '}\n'
+} > "$OUT.manifest"
+
+# --- 5. the artifact asserts itself (a render that cannot be checked is not a render)
+wav_bytes=$(wc -c < "$OUT.wav")
+m4a_bytes=$(wc -c < "$OUT.m4a")
+[ "$wav_bytes" -gt 20000 ] || { echo "podcast-render: wav suspiciously small ($wav_bytes bytes)" >&2; exit 6; }
+[ "$m4a_bytes" -gt 5000 ]  || { echo "podcast-render: m4a suspiciously small ($m4a_bytes bytes)" >&2; exit 6; }
+awk -v t="$total" 'BEGIN{if (t+0 <= 0.5) exit 1}' || { echo "podcast-render: total duration is not positive ($total)" >&2; exit 6; }
+# two speakers must have produced DIFFERENT audio, or we rendered one voice twice
+if [ "$SELF_TEST" = 1 ]; then
+  voices_used=$(grep -c '"kind":"speech"' "$WORK/manifest.parts" || true)
+  distinct=$(awk -F'"sid":' '/"kind":"speech"/{split($2,a,","); print a[1]}' "$WORK/manifest.parts" | sort -u | wc -l)
+  [ "${distinct:-0}" -ge 2 ] || { echo "podcast-render: self-test used $distinct distinct voice(s), expected 2" >&2; exit 6; }
+  [ "${voices_used:-0}" -ge 2 ] || { echo "podcast-render: self-test rendered $voices_used speech segment(s), expected 2" >&2; exit 6; }
+fi
+
+printf 'podcast-render: ok — %s cues -> %s.wav (%s bytes, %ss) + %s.m4a (%s bytes) + %s.manifest\n' \
+  "$n_cues" "$OUT" "$wav_bytes" "$total" "$OUT" "$m4a_bytes" "$OUT"
